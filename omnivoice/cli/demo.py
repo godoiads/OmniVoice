@@ -575,6 +575,13 @@ Desenvolvido com [OmniVoice](https://github.com/k2-fsa/OmniVoice)
                     outputs=[vc_save_status, vc_saved],
                 )
 
+                # The choices above are read once at startup; re-read them on
+                # every page load so voices saved later show up after F5.
+                demo.load(
+                    lambda: gr.update(choices=_list_voices()),
+                    outputs=[vc_saved],
+                )
+
             # ==============================================================
             # Voice Design
             # ==============================================================
