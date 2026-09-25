@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.audio import load_audio, trim_long_audio
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
 
@@ -41,6 +42,11 @@ from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
 # ---------------------------------------------------------------------------
 _VOICES_DIR = Path(__file__).resolve().parent.parent.parent / "voices"
 _VOICES_DIR.mkdir(exist_ok=True)
+
+# Default max length (seconds) of the reference audio used for cloning.
+# Measured on a real PT-BR voice (25/09/2026): 5-15 s tie on speaker
+# similarity; 20 s and 30 s scored lower and generated 4-5x slower.
+_REF_MAX_PADRAO = 10
 
 
 def _list_voices():
@@ -191,6 +197,34 @@ def build_demo(
 
     sampling_rate = model.sampling_rate
 
+    # Last voice prompt built from a reference audio (used by "Salvar voz").
+    _last_voice_prompt = {"data": None}
+
+    def _clone_prompt(ref_audio, ref_text, max_ref):
+        """Build the voice prompt from the reference audio.
+
+        Without a typed transcript, long audio is cut at a pause between
+        words (never mid-word) at up to ``max_ref`` seconds, and the exact
+        cut is transcribed so the model does not trim it again at 20 s.
+        With a typed transcript the full audio is kept to match the text.
+        """
+        wav = load_audio(ref_audio, sampling_rate)
+        if not ref_text:
+            wav = trim_long_audio(
+                wav,
+                sampling_rate,
+                max_duration=float(max_ref),
+                min_duration=3.0,
+                trim_threshold=float(max_ref),
+            )
+            ref_text = model.transcribe((wav, sampling_rate))
+        prompt = model.create_voice_clone_prompt(
+            ref_audio=(torch.from_numpy(wav), sampling_rate),
+            ref_text=ref_text,
+        )
+        _last_voice_prompt["data"] = prompt
+        return prompt
+
     # -- shared generation core --
     def _gen_core(
         text,
@@ -206,6 +240,7 @@ def build_demo(
         postprocess_output,
         mode,
         ref_text=None,
+        max_ref=None,
     ):
         if not text or not text.strip():
             return None, "Digite o texto para sintetizar."
@@ -229,21 +264,20 @@ def build_demo(
         if duration is not None and float(duration) > 0:
             kw["duration"] = float(duration)
 
+        ref_info = ""
         if mode == "clone":
             if not ref_audio:
                 return None, "Envie um audio de referencia."
-            # Auto-trim: usar apenas os primeiros 8 segundos
-            import torchaudio as _ta
-            _wav, _sr = _ta.load(ref_audio)
-            _max_samples = _sr * 8
-            if _wav.shape[1] > _max_samples:
-                _trimmed_path = ref_audio + ".trim.wav"
-                _ta.save(_trimmed_path, _wav[:, :_max_samples], _sr)
-                ref_audio = _trimmed_path
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
+            try:
+                prompt = _clone_prompt(ref_audio, ref_text, max_ref or _REF_MAX_PADRAO)
+            except Exception as e:
+                return None, f"Erro no audio de referencia: {type(e).__name__}: {e}"
+            kw["voice_clone_prompt"] = prompt
+            ref_seg = (
+                prompt.ref_audio_tokens.shape[-1]
+                / model.audio_tokenizer.config.frame_rate
             )
+            ref_info = f" Referencia usada: {ref_seg:.1f} s de fala."
 
         if instruct and instruct.strip():
             kw["instruct"] = instruct.strip()
@@ -254,7 +288,7 @@ def build_demo(
             return None, f"Error: {type(e).__name__}: {e}"
 
         waveform = (audio[0] * 32767).astype(np.int16)
-        return (sampling_rate, waveform), "Pronto."
+        return (sampling_rate, waveform), "Pronto." + ref_info
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -416,10 +450,18 @@ Desenvolvido com [OmniVoice](https://github.com/k2-fsa/OmniVoice)
                             type="filepath",
                             elem_classes="compact-audio",
                         )
-                        gr.Markdown(
-                            "<span style='font-size:0.85em;color:#888;'>"
-                            "Recomendado: audio de 3 a 10 segundos."
-                            "</span>"
+                        vc_max_ref = gr.Slider(
+                            5,
+                            20,
+                            value=_REF_MAX_PADRAO,
+                            step=1,
+                            label="Tamanho maximo da referencia (segundos)",
+                            info=(
+                                "Pode enviar um audio mais longo: ele e cortado"
+                                " numa pausa entre palavras ate este limite."
+                                " Melhor resultado entre 8 e 15 s; acima disso"
+                                " a voz fica menos parecida e demora mais."
+                            ),
                         )
                         vc_ref_text = gr.Textbox(
                             label="Texto do audio de referencia (opcional)",
@@ -456,12 +498,9 @@ Desenvolvido com [OmniVoice](https://github.com/k2-fsa/OmniVoice)
                         )
                         vc_status = gr.Textbox(label="Status", lines=2)
 
-                # Store last voice prompt for saving
-                _last_voice_prompt = {"data": None}
-
                 def _clone_fn(
                     text, lang, saved_voice, ref_aud, ref_text, instruct,
-                    ns, gs, dn, sp, du, pp, po,
+                    ns, gs, dn, sp, du, pp, po, max_ref,
                 ):
                     # Use saved voice if selected
                     saved = _load_voice(saved_voice)
@@ -494,30 +533,12 @@ Desenvolvido com [OmniVoice](https://github.com/k2-fsa/OmniVoice)
                         waveform = (audio[0] * 32767).astype(np.int16)
                         return (sampling_rate, waveform), f"Pronto. (voz salva: {saved_voice})"
 
-                    # Otherwise use ref audio (original flow)
-                    result = _gen(
+                    # Otherwise use ref audio; _clone_prompt keeps the prompt for saving
+                    return _gen(
                         text, lang, ref_aud, instruct,
                         ns, gs, dn, sp, du, pp, po,
-                        mode="clone", ref_text=ref_text or None,
+                        mode="clone", ref_text=ref_text or None, max_ref=max_ref,
                     )
-                    # Capture the voice prompt for saving
-                    if ref_aud:
-                        try:
-                            import torchaudio as _ta
-                            _wav, _sr = _ta.load(ref_aud)
-                            _max_samples = _sr * 8
-                            _audio_path = ref_aud
-                            if _wav.shape[1] > _max_samples:
-                                _trimmed = ref_aud + ".trim.wav"
-                                _ta.save(_trimmed, _wav[:, :_max_samples], _sr)
-                                _audio_path = _trimmed
-                            _last_voice_prompt["data"] = model.create_voice_clone_prompt(
-                                ref_audio=_audio_path,
-                                ref_text=ref_text or None,
-                            )
-                        except Exception:
-                            pass
-                    return result
 
                 def _save_fn(name):
                     if not name or not name.strip():
@@ -543,6 +564,7 @@ Desenvolvido com [OmniVoice](https://github.com/k2-fsa/OmniVoice)
                         vc_du,
                         vc_pp,
                         vc_po,
+                        vc_max_ref,
                     ],
                     outputs=[vc_audio, vc_status],
                 )
